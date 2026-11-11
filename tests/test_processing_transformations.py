@@ -1551,8 +1551,8 @@ def test_valuelist_placeholders(sigma_rule_placeholders_simple: SigmaRule):
                         "field",
                         [SigmaExpandModifier],
                         [
-                            SigmaString("valueval1testval3*end"),
-                            SigmaString("value123testval3*end"),
+                            SigmaString("valueval1testval3\\*end"),
+                            SigmaString("value123testval3\\*end"),
                         ],
                     ),
                 ]

@@ -115,9 +115,46 @@ class WildcardPlaceholderTransformation(BasePlaceholderTransformation):
 class ValueListPlaceholderTransformation(BasePlaceholderTransformation):
     """
     Replaces placeholders with values contained in variables defined in the configuration.
+
+    The replacement values are treated as plain data: wildcard characters and escaping
+    sequences contained in them are inserted literally and don't change the matching
+    semantics declared by the rule. Backends escape them further as required by the
+    target query language, so values can never break out of the value context and alter
+    the structure of the generated query. Use QueryExpressionPlaceholderTransformation
+    if raw query expressions should be generated from the configuration.
+
+    Exception: placeholders in regular expression values (``|re`` modifier) are replaced
+    with the parsed value, because such values are regular expression fragments by
+    definition. Like query expressions, these must only come from trusted configuration.
     """
 
+    def apply_value(
+        self, field: str | None, val: SigmaType
+    ) -> (
+        None
+        | SigmaString
+        | Iterable[SigmaString]
+        | SigmaRegularExpression
+        | Iterable[SigmaRegularExpression]
+    ):
+        if isinstance(val, SigmaRegularExpression) and val.contains_placeholder(
+            self.include, self.exclude
+        ):  # regex values are regex fragments: keep parsing replacements
+            return val.replace_placeholders(self.placeholder_replacements_regex_base)
+        return super().apply_value(field, val)
+
+    def placeholder_replacements_regex_base(
+        self, p: Placeholder
+    ) -> Iterator[str | SpecialChars | Placeholder | SigmaString]:
+        if self.is_handled_placeholder(p):
+            yield from (SigmaString(v) for v in self.replacement_values(p))
+        else:
+            yield p
+
     def placeholder_replacements(self, p: Placeholder) -> Iterable[SigmaString]:
+        return [SigmaString.from_str(v) for v in self.replacement_values(p)]
+
+    def replacement_values(self, p: Placeholder) -> list[str]:
         try:
             if self._pipeline is None:
                 raise SigmaValueError("No pipeline available for placeholder replacement.")
@@ -128,12 +165,15 @@ class ValueListPlaceholderTransformation(BasePlaceholderTransformation):
         if not isinstance(values, list):
             values = [values]
 
+        if not values:
+            raise SigmaValueError(f"Replacement variable '{ p.name }' is empty.")
+
         if {isinstance(item, (str, int, float)) for item in values} != {True}:
             raise SigmaValueError(
                 f"Replacement variable '{ p.name }' contains value which is not a string or number."
             )
 
-        return [SigmaString(str(v)) for v in values]
+        return [str(v) for v in values]
 
 
 @dataclass
@@ -144,6 +184,13 @@ class QueryExpressionPlaceholderTransformation(
     Replaces a placeholder with a plain query containing the placeholder or an identifier
     mapped from the placeholder name. The main purpose is the generation of arbitrary
     list lookup expressions which are passed to the resulting query.
+
+    .. warning::
+       The expression and the mapped identifiers are inserted into the resulting query
+       verbatim and are NOT escaped. They are trusted raw query fragments that must only
+       be provided and reviewed by the processing pipeline author or another trusted
+       configuration source, never from untrusted input such as rule content. Use
+       ValueListPlaceholderTransformation for plain data values, which are always escaped.
 
     Parameters:
     * expression: string that contains query expression with {field} and {id} placeholder

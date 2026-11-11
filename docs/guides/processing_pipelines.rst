@@ -575,6 +575,34 @@ These are the ``type`` values for the ``transformations`` section.
      - ``CommandPlaceholderTransformation``
      - Replace placeholders with values from external command outputs.
 
+.. note::
+   **Placeholder value safety**
+
+   ``value_placeholders`` treats variable values as plain *data*. Quotes,
+   wildcards and query-language-looking text in a value are inserted literally
+   and escaped by the backend for the target query language, so a value can
+   never break out of its value context and change the structure of the
+   generated query. Wildcard semantics declared by the rule itself (e.g. in
+   ``field: "start*%var%"``) are not affected. An empty variable list is
+   rejected with an error instead of silently weakening the rule.
+
+   Example: with ``vars: {acct: 'x" or 1=1 or "'}`` and a rule containing
+   ``User|expand: "%acct%"``, the test backend generates
+   ``User="x\" or 1=1 or \""`` — the value stays a single string comparison.
+   An event with ``User: x" or 1=1 or "`` matches; an arbitrary event like
+   ``User: admin`` does not, because the injected text is data, not query
+   syntax. A value of ``*`` likewise renders as a literal ``\*`` and only
+   matches an event whose field is exactly ``*``.
+
+   Two exceptions remain *trusted raw fragments* and must only be provided
+   and reviewed by the pipeline author or another trusted configuration
+   source, never from untrusted input such as rule content:
+
+   * ``query_expression_placeholders``: the configured ``expression`` and the
+     mapped identifiers are inserted into the query verbatim.
+   * ``value_placeholders`` used in regular expression values (``|re``
+     modifier): values are regular expression fragments by definition.
+
 **Failure Transformations:**
 
 .. list-table::
