@@ -60,6 +60,7 @@ class MatchCompiler:
         func_code = f"def _match(data, raw):\n    return {expr}\n"
         namespace: dict[str, Any] = {"__builtins__": {"str": str}}
         namespace.update(closures)
+        namespace.update(_MATCHER_HELPERS)
         code_obj = compile(func_code, "<sigma_matcher>", "exec")
         exec(code_obj, namespace)  # noqa: S102
         return namespace["_match"]  # type: ignore[no-any-return]
@@ -87,7 +88,7 @@ class MatchCompiler:
 
         elif isinstance(value, SigmaBool):
             bool_val = bool(value)
-            return f"(data.get({field_name!r}) is {bool_val})"
+            return f"(_match_bool(data.get({field_name!r}), {bool_val!r}))"
 
         elif isinstance(value, SigmaExists):
             if value.exists:
@@ -99,31 +100,39 @@ class MatchCompiler:
             ref_field = value.field
             if value.starts_with and value.ends_with:
                 # contains
-                return f"(str(data.get({ref_field!r}, '')) in str(data.get({field_name!r}, '')))"
+                return (
+                    f"(_match_fieldref_contains(data.get({field_name!r}), "
+                    f"data.get({ref_field!r})))"
+                )
             elif value.starts_with:
-                return f"(str(data.get({field_name!r}, '')).startswith(str(data.get({ref_field!r}, ''))))"
+                return (
+                    f"(_match_fieldref_prefix(data.get({field_name!r}), "
+                    f"data.get({ref_field!r})))"
+                )
             elif value.ends_with:
-                return f"(str(data.get({field_name!r}, '')).endswith(str(data.get({ref_field!r}, ''))))"
+                return (
+                    f"(_match_fieldref_suffix(data.get({field_name!r}), "
+                    f"data.get({ref_field!r})))"
+                )
             else:
-                return f"(data.get({field_name!r}) == data.get({ref_field!r}))"
+                return f"(_match_fieldref_eq(data.get({field_name!r}), data.get({ref_field!r})))"
 
         elif isinstance(value, SigmaCompareExpression):
             num_val = value.number.number
             op_map = {
-                CompareOperators.LT: "<",
-                CompareOperators.LTE: "<=",
-                CompareOperators.GT: ">",
-                CompareOperators.GTE: ">=",
-                CompareOperators.NEQ: "!=",
+                CompareOperators.LT: "lt",
+                CompareOperators.LTE: "lte",
+                CompareOperators.GT: "gt",
+                CompareOperators.GTE: "gte",
+                CompareOperators.NEQ: "neq",
             }
-            op_str = op_map[value.op]
-            return f"(data.get({field_name!r}, 0) {op_str} {num_val!r})"
+            op_name = op_map[value.op]
+            return f"(_match_compare(data.get({field_name!r}), {op_name!r}, {num_val!r}))"
 
         elif isinstance(value, SigmaCIDRExpression):
             var_name = f"_cidr_{len(closures)}"
             closures[var_name] = value.network
-            closures["_try_cidr"] = _try_cidr
-            return f"(_try_cidr(data.get({field_name!r}, ''), {var_name}))"
+            return f"(_match_cidr(data.get({field_name!r}), {var_name}))"
 
         elif isinstance(value, SigmaExpansion):
             # OR over all expansion values
@@ -138,11 +147,11 @@ class MatchCompiler:
             for flag in value.flags:
                 flags |= value.sigma_to_python_flags[flag]
             closures[var_name] = re.compile(str(value.regexp), flags)
-            return f"({var_name}.search(str(data.get({field_name!r}, ''))) is not None)"
+            return f"(_match_regex(data.get({field_name!r}), {var_name}))"
 
         elif isinstance(value, SigmaNumber):
             num = value.number
-            return f"(data.get({field_name!r}) == {num!r})"
+            return f"(_match_number(data.get({field_name!r}), {num!r}))"
 
         elif isinstance(value, SigmaCasedString):
             # Case-sensitive matching
@@ -166,17 +175,17 @@ class MatchCompiler:
             # Plain string equality
             plain = str(value)
             if case_sensitive:
-                return f"(str(data.get({field_name!r}, '')) == {plain!r})"
+                return f"(_match_string_cased(data.get({field_name!r}), {plain!r}))"
             else:
                 lower_val = plain.lower()
-                return f"(str(data.get({field_name!r}, '')).lower() == {lower_val!r})"
+                return f"(_match_string(data.get({field_name!r}), {lower_val!r}))"
         else:
             # Contains wildcards - compile to regex
             regex_str = self._sigma_string_to_regex(value)
             flags = 0 if case_sensitive else re.IGNORECASE
             var_name = f"_pat_{len(closures)}"
             closures[var_name] = re.compile(regex_str, flags)
-            return f"({var_name}.search(str(data.get({field_name!r}, ''))) is not None)"
+            return f"(_match_regex(data.get({field_name!r}), {var_name}))"
 
     def _sigma_string_to_regex(self, value: SigmaString) -> str:
         """Convert a SigmaString with wildcards to a regex pattern (anchored)."""
@@ -225,9 +234,132 @@ class MatchCompiler:
             return "False"
 
 
-def _try_cidr(value: Any, network: Any) -> bool:
-    """Check if value is an IP within the given network."""
-    try:
-        return ip_address(str(value)) in network
-    except (ValueError, TypeError):
-        return False
+def _as_elements(value: Any) -> list[Any]:
+    """Normalize an event field value to the list of elements to test.
+
+    A list-valued event field is matched element-wise; any other value is a
+    single element. Missing fields and explicit null yield no elements, so
+    positive predicates return False and an outer NOT negates them to True
+    without ever coercing them to empty strings.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _match_string(value: Any, expected_lower: str) -> bool:
+    return any(
+        isinstance(element, str) and element.lower() == expected_lower
+        for element in _as_elements(value)
+    )
+
+
+def _match_string_cased(value: Any, expected: str) -> bool:
+    return any(
+        isinstance(element, str) and element == expected for element in _as_elements(value)
+    )
+
+
+def _match_number(value: Any, expected: int | float) -> bool:
+    return any(
+        isinstance(element, (int, float))
+        and not isinstance(element, bool)
+        and element == expected
+        for element in _as_elements(value)
+    )
+
+
+def _match_bool(value: Any, expected: bool) -> bool:
+    return any(element is expected for element in _as_elements(value))
+
+
+def _match_regex(value: Any, pattern: re.Pattern[str]) -> bool:
+    return any(
+        isinstance(element, str) and pattern.search(element) is not None
+        for element in _as_elements(value)
+    )
+
+
+_COMPARE_OPS = {
+    "lt": lambda element, expected: element < expected,
+    "lte": lambda element, expected: element <= expected,
+    "gt": lambda element, expected: element > expected,
+    "gte": lambda element, expected: element >= expected,
+    "neq": lambda element, expected: element != expected,
+}
+
+
+def _match_compare(value: Any, op_name: str, expected: int | float) -> bool:
+    compare = _COMPARE_OPS[op_name]
+    return any(
+        isinstance(element, (int, float))
+        and not isinstance(element, bool)
+        and compare(element, expected)
+        for element in _as_elements(value)
+    )
+
+
+def _match_cidr(value: Any, network: Any) -> bool:
+    def in_network(element: Any) -> bool:
+        try:
+            return ip_address(str(element)) in network
+        except (ValueError, TypeError):
+            return False
+
+    return any(in_network(element) for element in _as_elements(value))
+
+
+def _match_fieldref_eq(value: Any, referenced: Any) -> bool:
+    return any(
+        element == other
+        for element in _as_elements(value)
+        for other in _as_elements(referenced)
+    )
+
+
+def _match_fieldref_prefix(value: Any, referenced: Any) -> bool:
+    return any(
+        isinstance(element, str)
+        and isinstance(other, str)
+        and element.startswith(other)
+        for element in _as_elements(value)
+        for other in _as_elements(referenced)
+    )
+
+
+def _match_fieldref_suffix(value: Any, referenced: Any) -> bool:
+    return any(
+        isinstance(element, str)
+        and isinstance(other, str)
+        and element.endswith(other)
+        for element in _as_elements(value)
+        for other in _as_elements(referenced)
+    )
+
+
+def _match_fieldref_contains(value: Any, referenced: Any) -> bool:
+    return any(
+        isinstance(element, str)
+        and isinstance(other, str)
+        and other in element
+        for element in _as_elements(value)
+        for other in _as_elements(referenced)
+    )
+
+
+_MATCHER_HELPERS = {
+    "_as_elements": _as_elements,
+    "_match_string": _match_string,
+    "_match_string_cased": _match_string_cased,
+    "_match_number": _match_number,
+    "_match_bool": _match_bool,
+    "_match_regex": _match_regex,
+    "_match_compare": _match_compare,
+    "_match_cidr": _match_cidr,
+    "_match_fieldref_eq": _match_fieldref_eq,
+    "_match_fieldref_prefix": _match_fieldref_prefix,
+    "_match_fieldref_suffix": _match_fieldref_suffix,
+    "_match_fieldref_contains": _match_fieldref_contains,
+}
