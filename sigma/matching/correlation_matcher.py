@@ -127,18 +127,22 @@ class SigmaCorrelationRuleMatcher:
         return bool(op_map[op](value, threshold))
 
     def _collect_events(self, matches: list[SigmaMatch]) -> list[Event]:
-        """Collect events from matches, respecting the max_events_per_match limit."""
+        """Collect events from matches, respecting the max_events_per_match limit.
+
+        The same event object is included only once, even if several matches
+        reference it (one event hitting multiple base rules, duplicate delivery).
+        """
         events: list[Event] = []
+        seen: set[int] = set()
         limit = self.max_events_per_match
-        if limit is None:
-            for m in matches:
-                events.extend(m.events)
-        else:
-            for m in matches:
-                for e in m.events:
-                    if len(events) >= limit:
-                        return events
-                    events.append(e)
+        for m in matches:
+            for e in m.events:
+                if id(e) in seen:
+                    continue
+                if limit is not None and len(events) >= limit:
+                    return events
+                seen.add(id(e))
+                events.append(e)
         return events
 
     def _make_group_values(self, group_key: tuple[Any, ...]) -> dict[str, Any] | None:
@@ -214,36 +218,44 @@ class SigmaCorrelationRuleMatcher:
     def _eval_ordered_extended_expr(
         self,
         node: CorrelationConditionItem | SigmaRuleReference,
-        rule_first_fire: dict[str, Any],
+        rule_timestamps: dict[str, list[Any]],
+        after: Any = None,
     ) -> tuple[bool, Any]:
         """Evaluate a boolean expression with ordering constraints.
 
-        Returns (satisfied, last_timestamp) where last_timestamp is the timestamp of the
-        last positively matched rule in the sub-expression (None for negated sub-expressions).
-        For AND, each successive operand's first-fire timestamp must be >= previous operand's.
+        rule_timestamps maps each referenced rule name to its sorted match timestamps.
+        Returns (satisfied, end_timestamp) where end_timestamp is the earliest timestamp
+        at which the sub-expression can be satisfied using only matches strictly after
+        `after` (None for negated sub-expressions, which contribute no ordering
+        constraint). Strictly increasing timestamps are required between successive
+        AND operands, so a single event can never satisfy two successive operands.
         """
         if isinstance(node, SigmaRuleReference):
-            ts = rule_first_fire.get(node.reference)
-            return ts is not None, ts
-        elif isinstance(node, CorrelationConditionAND):
-            last_ts: Any = None
-            for arg in node.args:
-                ok, ts = self._eval_ordered_extended_expr(arg, rule_first_fire)
-                if not ok:
-                    return False, None
-                if last_ts is not None and ts is not None and ts < last_ts:
-                    return False, None
-                if ts is not None:
-                    last_ts = ts
-            return True, last_ts
-        elif isinstance(node, CorrelationConditionOR):
-            for arg in node.args:
-                ok, ts = self._eval_ordered_extended_expr(arg, rule_first_fire)
-                if ok:
+            for ts in rule_timestamps.get(node.reference, ()):
+                if after is None or ts > after:
                     return True, ts
             return False, None
+        elif isinstance(node, CorrelationConditionAND):
+            end = after
+            for arg in node.args:
+                ok, ts = self._eval_ordered_extended_expr(arg, rule_timestamps, end)
+                if not ok:
+                    return False, None
+                if ts is not None:
+                    end = ts
+            return True, end
+        elif isinstance(node, CorrelationConditionOR):
+            satisfied = False
+            best: Any = None
+            for arg in node.args:
+                ok, ts = self._eval_ordered_extended_expr(arg, rule_timestamps, after)
+                if ok:
+                    satisfied = True
+                    if ts is not None and (best is None or ts < best):
+                        best = ts
+            return satisfied, best
         elif isinstance(node, CorrelationConditionNOT):
-            ok, _ = self._eval_ordered_extended_expr(node.args[0], rule_first_fire)
+            ok, _ = self._eval_ordered_extended_expr(node.args[0], rule_timestamps)
             return not ok, None
         return False, None
 
@@ -253,7 +265,13 @@ class SigmaCorrelationRuleMatcher:
         group_key: tuple[Any, ...],
         now: Any,
     ) -> list[SigmaMatch]:
-        """All referenced rules must fire within the time window."""
+        """All referenced rules must fire within the time window.
+
+        Set semantics: every referenced rule needs at least one match in the
+        window. Duplicate rule references collapse, duplicate delivery of a
+        match does not change the outcome, and one event hitting several
+        referenced rules satisfies each of them.
+        """
         if isinstance(self.rule.condition, SigmaExtendedCorrelationCondition):
             fired_rules: set[str] = {
                 name for m in matches if (name := getattr(m.rule, "name", None))
@@ -289,14 +307,23 @@ class SigmaCorrelationRuleMatcher:
         group_key: tuple[Any, ...],
         now: Any,
     ) -> list[SigmaMatch]:
-        """All referenced rules must fire in order within the time window."""
+        """All referenced rules must fire in order within the time window.
+
+        Ordering criterion: successive referenced rules must be satisfied by matches
+        with strictly increasing event timestamps. Matches with equal timestamps
+        (one event hitting several rules, distinct events sharing a timestamp,
+        duplicate delivery) cannot establish an order and never satisfy two
+        successive positions, so the result never depends on traversal order.
+        """
         if isinstance(self.rule.condition, SigmaExtendedCorrelationCondition):
-            rule_first_fire: dict[str, Any] = {}
-            for m in sorted(matches, key=lambda x: x.timestamp):
+            rule_timestamps: dict[str, list[Any]] = defaultdict(list)
+            for m in matches:
                 name = getattr(m.rule, "name", None)
-                if name and name not in rule_first_fire:
-                    rule_first_fire[name] = m.timestamp
-            ok, _ = self._eval_ordered_extended_expr(self.rule.condition.parsed, rule_first_fire)
+                if name:
+                    rule_timestamps[name].append(m.timestamp)
+            for timestamps in rule_timestamps.values():
+                timestamps.sort()
+            ok, _ = self._eval_ordered_extended_expr(self.rule.condition.parsed, rule_timestamps)
             if ok:
                 return [
                     SigmaMatch(
@@ -310,20 +337,26 @@ class SigmaCorrelationRuleMatcher:
         if not self.rule.rules:
             return []
         expected_order = [ref.reference for ref in self.rule.rules]
-        # Find first occurrence of each in order
+        # Greedily match the expected rule sequence against matches sorted by
+        # timestamp, requiring strictly increasing timestamps between positions.
         seen_idx = 0
+        last_ts: Any = None
         for m in sorted(matches, key=lambda x: x.timestamp):
-            if hasattr(m.rule, "name") and m.rule.name == expected_order[seen_idx]:
-                seen_idx += 1
-                if seen_idx >= len(expected_order):
-                    return [
-                        SigmaMatch(
-                            rule=self.rule,
-                            events=self._collect_events(matches),
-                            timestamp=now,
-                            group_values=self._make_group_values(group_key),
-                        )
-                    ]
+            if not (hasattr(m.rule, "name") and m.rule.name == expected_order[seen_idx]):
+                continue
+            if last_ts is not None and m.timestamp <= last_ts:
+                continue
+            last_ts = m.timestamp
+            seen_idx += 1
+            if seen_idx >= len(expected_order):
+                return [
+                    SigmaMatch(
+                        rule=self.rule,
+                        events=self._collect_events(matches),
+                        timestamp=now,
+                        group_values=self._make_group_values(group_key),
+                    )
+                ]
         return []
 
     def _eval_value_aggregate(

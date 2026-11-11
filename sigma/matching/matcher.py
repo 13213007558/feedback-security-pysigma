@@ -66,11 +66,15 @@ class SigmaMatcher:
                 )
                 self._correlation_matchers.append(cm)
                 if rule.rules:
-                    for ref in rule.rules:
-                        self._correlation_map[ref.reference].append(cm)
+                    referenced_names = [ref.reference for ref in rule.rules]
                 elif isinstance(rule.condition, SigmaExtendedCorrelationCondition):
-                    for name in rule.condition.get_referenced_rules():
-                        self._correlation_map[name].append(cm)
+                    referenced_names = rule.condition.get_referenced_rules()
+                else:
+                    referenced_names = []
+                # Register each referenced rule once so that duplicate references
+                # don't cause duplicate receive_match calls for the same match.
+                for name in dict.fromkeys(referenced_names):
+                    self._correlation_map[name].append(cm)
 
     def match(self, event: Event) -> list[SigmaMatch]:
         """Match a single event against all relevant rules. Returns list of matches."""

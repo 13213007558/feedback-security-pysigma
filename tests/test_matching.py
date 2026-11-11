@@ -1063,6 +1063,427 @@ correlation:
             assert not any(m.rule.name == "ext_and_corr" for m in matches)
 
 
+class TestTemporalCorrelationSemantics:
+    """Pin down temporal / temporal_ordered semantics for edge cases: one event
+    hitting multiple rules, duplicate delivery, distinct events sharing a
+    timestamp, window boundaries, group-by isolation, duplicate rule references
+    and field aliases.
+
+    Explicit criteria under test:
+    - temporal: set semantics. Every referenced rule needs at least one match in
+      the window. One event hitting several rules satisfies each of them;
+      duplicate references collapse; duplicate delivery is a no-op.
+    - temporal_ordered: successive referenced rules must be satisfied by matches
+      with strictly increasing event timestamps. Equal timestamps (one event
+      hitting several rules, distinct events sharing a timestamp, duplicate
+      delivery) can never establish an order, so the outcome never depends on
+      rule declaration or traversal order.
+
+    All tests use fixed event timestamps and stable event object identity;
+    no real clock is involved.
+    """
+
+    T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    LS = EventLogSource(category="test", product="test")
+
+    _RULE_A = """
+title: Rule A
+name: rule_a
+status: test
+logsource:
+    category: test
+    product: test
+detection:
+    selection:
+        event: "login"
+    condition: selection
+"""
+
+    _RULE_B = """
+title: Rule B
+name: rule_b
+status: test
+logsource:
+    category: test
+    product: test
+detection:
+    selection:
+        event: "access"
+    condition: selection
+"""
+
+    # Overlapping variant: the event {"event": "login", "user": "alice"}
+    # hits rule_a and rule_b_overlap at the same timestamp.
+    _RULE_B_OVERLAP = """
+title: Rule B Overlap
+name: rule_b
+status: test
+logsource:
+    category: test
+    product: test
+detection:
+    selection:
+        user: "alice"
+    condition: selection
+"""
+
+    _ORDERED_CORR = """
+title: Ordered Corr
+name: corr
+status: test
+correlation:
+    type: temporal_ordered
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - user
+    timespan: 5m
+"""
+
+    _TEMPORAL_CORR = """
+title: Temporal Corr
+name: corr
+status: test
+correlation:
+    type: temporal
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - user
+    timespan: 5m
+"""
+
+    def _collection(self, *docs: str) -> SigmaCollection:
+        return SigmaCollection.from_yaml("---".join(docs))
+
+    def _event(self, seconds: float, **data) -> Event:
+        return Event(
+            timestamp=self.T0 + timedelta(seconds=seconds),
+            logsource=self.LS,
+            data=data,
+        )
+
+    def _corr_matches(self, matches: list[SigmaMatch]) -> list[SigmaMatch]:
+        return [m for m in matches if m.rule.name == "corr"]
+
+    # -- one event hitting multiple rules --
+
+    def test_temporal_single_event_multi_rule_hit_fires(self):
+        """temporal: one event hitting both rules satisfies both (unordered set semantics)."""
+        collection = self._collection(self._RULE_A, self._RULE_B_OVERLAP, self._TEMPORAL_CORR)
+        with SigmaMatcher(collection) as matcher:
+            combined = self._event(0, event="login", user="alice")
+            matches = matcher.match(combined)
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            # the shared event appears exactly once in the alert
+            assert corr[0].events == [combined]
+
+    def test_temporal_ordered_single_event_multi_rule_hit_never_fires(self):
+        """temporal_ordered: one event hitting both rules must not satisfy
+        'A then B', regardless of rule declaration order."""
+        for first, second in (
+            (self._RULE_A, self._RULE_B_OVERLAP),
+            (self._RULE_B_OVERLAP, self._RULE_A),
+        ):
+            collection = self._collection(first, second, self._ORDERED_CORR)
+            with SigmaMatcher(collection) as matcher:
+                combined = self._event(0, event="login", user="alice")
+                matches = matcher.match(combined)
+                assert self._corr_matches(matches) == []
+
+                # a strictly later rule_b occurrence establishes the order
+                b_event = self._event(30, event="access", user="alice")
+                matches = matcher.match(b_event)
+                corr = self._corr_matches(matches)
+                assert len(corr) == 1
+                assert corr[0].events == [combined, b_event]
+
+    # -- distinct events sharing a timestamp --
+
+    def test_temporal_same_timestamp_distinct_events_fires(self):
+        """temporal: order is irrelevant, equal timestamps are fine."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._TEMPORAL_CORR)
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", user="alice"))
+            matches = matcher.match(self._event(0, event="access", user="alice"))
+            assert len(self._corr_matches(matches)) == 1
+
+    def test_temporal_ordered_same_timestamp_distinct_events_no_fire(self):
+        """temporal_ordered: distinct events at the same timestamp have no
+        determinable order and must not fire."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            a_event = self._event(0, event="login", user="alice")
+            b_same_ts = self._event(0, event="access", user="alice")
+            matcher.match(a_event)
+            matches = matcher.match(b_same_ts)
+            assert self._corr_matches(matches) == []
+
+            # a strictly later rule_b event completes the ordered sequence
+            b_later = self._event(1, event="access", user="alice")
+            matches = matcher.match(b_later)
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            assert corr[0].events == [a_event, b_same_ts, b_later]
+
+    # -- ordering --
+
+    def test_temporal_ordered_strictly_increasing_fires(self):
+        """temporal_ordered: A strictly before B fires; alert events are in order."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            a_event = self._event(0, event="login", user="alice")
+            b_event = self._event(30, event="access", user="alice")
+            matcher.match(a_event)
+            matches = matcher.match(b_event)
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            assert corr[0].events == [a_event, b_event]
+
+    def test_temporal_ordered_wrong_order_no_fire(self):
+        """temporal_ordered: B before A never fires."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="access", user="alice"))
+            matches = matcher.match(self._event(30, event="login", user="alice"))
+            assert self._corr_matches(matches) == []
+
+    # -- duplicate delivery --
+
+    def test_temporal_ordered_duplicate_delivery_idempotent(self):
+        """temporal_ordered: re-delivering the same event object neither inflates
+        the alert event set nor manufactures an order."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            a_event = self._event(0, event="login", user="alice")
+            matcher.match(a_event)
+            matches = matcher.match(a_event)  # duplicate delivery
+            assert self._corr_matches(matches) == []
+            b_event = self._event(30, event="access", user="alice")
+            matches = matcher.match(b_event)
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            assert corr[0].events == [a_event, b_event]
+
+    def test_temporal_ordered_duplicate_multi_hit_event_still_no_fire(self):
+        """temporal_ordered: duplicate delivery of one event hitting both rules
+        still cannot establish an order."""
+        collection = self._collection(self._RULE_A, self._RULE_B_OVERLAP, self._ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            combined = self._event(0, event="login", user="alice")
+            matcher.match(combined)
+            matches = matcher.match(combined)
+            assert self._corr_matches(matches) == []
+
+    def test_temporal_duplicate_delivery_idempotent(self):
+        """temporal: duplicate delivery does not change the outcome."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._TEMPORAL_CORR)
+        with SigmaMatcher(collection) as matcher:
+            a_event = self._event(0, event="login", user="alice")
+            matcher.match(a_event)
+            matcher.match(a_event)  # duplicate delivery
+            b_event = self._event(0, event="access", user="alice")
+            matches = matcher.match(b_event)
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            assert corr[0].events == [a_event, b_event]
+
+    # -- window boundary --
+
+    def test_temporal_ordered_window_boundary(self):
+        """temporal_ordered: a match exactly `timespan` old is still inside the
+        window (inclusive boundary); anything older is evicted."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", user="alice"))
+            matches = matcher.match(self._event(300, event="access", user="alice"))
+            assert len(self._corr_matches(matches)) == 1
+
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", user="alice"))
+            matches = matcher.match(self._event(301, event="access", user="alice"))
+            assert self._corr_matches(matches) == []
+
+    def test_temporal_window_boundary(self):
+        """temporal: same inclusive boundary semantics."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._TEMPORAL_CORR)
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", user="alice"))
+            matches = matcher.match(self._event(300, event="access", user="alice"))
+            assert len(self._corr_matches(matches)) == 1
+
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", user="alice"))
+            matches = matcher.match(self._event(301, event="access", user="alice"))
+            assert self._corr_matches(matches) == []
+
+    # -- group-by isolation --
+
+    def test_temporal_ordered_group_by_isolation(self):
+        """temporal_ordered: matches in other group-by values neither interfere
+        nor complete the sequence."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", user="alice"))
+            matches = matcher.match(self._event(10, event="access", user="bob"))
+            assert self._corr_matches(matches) == []
+            matches = matcher.match(self._event(20, event="access", user="alice"))
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            assert corr[0].group_values == {"user": "alice"}
+            assert [e.data["user"] for e in corr[0].events] == ["alice", "alice"]
+
+    # -- duplicate rule references --
+
+    def test_temporal_ordered_duplicate_rule_reference(self):
+        """temporal_ordered with rules [A, A]: requires two occurrences of A with
+        strictly increasing timestamps; one event (even re-delivered) is not enough."""
+        dup_corr = self._ORDERED_CORR.replace("        - rule_b\n", "        - rule_a\n")
+        collection = self._collection(self._RULE_A, self._RULE_B, dup_corr)
+        with SigmaMatcher(collection) as matcher:
+            a1 = self._event(0, event="login", user="alice")
+            matcher.match(a1)
+            matches = matcher.match(a1)  # duplicate delivery, same timestamp
+            assert self._corr_matches(matches) == []
+            a2 = self._event(10, event="login", user="alice")
+            matches = matcher.match(a2)
+            corr = self._corr_matches(matches)
+            # exactly one alert: duplicate references must not double-register
+            # the correlation matcher
+            assert len(corr) == 1
+            assert corr[0].events == [a1, a2]
+
+    def test_temporal_duplicate_rule_reference_set_semantics(self):
+        """temporal with rules [A, A]: duplicate references collapse, a single
+        occurrence of A satisfies the correlation."""
+        dup_corr = self._TEMPORAL_CORR.replace("        - rule_b\n", "        - rule_a\n")
+        collection = self._collection(self._RULE_A, self._RULE_B, dup_corr)
+        with SigmaMatcher(collection) as matcher:
+            matches = matcher.match(self._event(0, event="login", user="alice"))
+            assert len(self._corr_matches(matches)) == 1
+
+    # -- extended conditions stay consistent with the rules-list form --
+
+    _EXT_ORDERED_CORR = """
+title: Extended Ordered Corr
+name: corr
+status: test
+correlation:
+    type: temporal_ordered
+    condition: rule_a and rule_b
+    group-by:
+        - user
+    timespan: 5m
+"""
+
+    def test_extended_ordered_single_event_multi_rule_hit_never_fires(self):
+        """Extended temporal_ordered: same criterion as the rules-list form —
+        one event hitting both rules cannot satisfy 'A and B in order'."""
+        collection = self._collection(self._RULE_A, self._RULE_B_OVERLAP, self._EXT_ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            combined = self._event(0, event="login", user="alice")
+            matches = matcher.match(combined)
+            assert self._corr_matches(matches) == []
+            b_event = self._event(30, event="access", user="alice")
+            matches = matcher.match(b_event)
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            assert corr[0].events == [combined, b_event]
+
+    def test_extended_ordered_later_occurrence_satisfies(self):
+        """Extended temporal_ordered: B@t0, A@t1, B@t2 contains an ordered
+        A-then-B occurrence pair and must fire."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._EXT_ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="access", user="alice"))
+            matcher.match(self._event(10, event="login", user="alice"))
+            matches = matcher.match(self._event(20, event="access", user="alice"))
+            assert len(self._corr_matches(matches)) == 1
+
+    def test_extended_ordered_same_timestamp_no_fire(self):
+        """Extended temporal_ordered: equal timestamps cannot establish an order."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._EXT_ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", user="alice"))
+            matches = matcher.match(self._event(0, event="access", user="alice"))
+            assert self._corr_matches(matches) == []
+
+    # -- field aliases --
+
+    _ALIAS_ORDERED_CORR = """
+title: Alias Ordered Corr
+name: corr
+status: test
+correlation:
+    type: temporal_ordered
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - user
+    timespan: 5m
+    aliases:
+        user:
+            rule_a: username
+            rule_b: user_name
+"""
+
+    _ALIAS_TEMPORAL_CORR = """
+title: Alias Temporal Corr
+name: corr
+status: test
+correlation:
+    type: temporal
+    rules:
+        - rule_a
+        - rule_b
+    group-by:
+        - user
+    timespan: 5m
+    aliases:
+        user:
+            rule_a: username
+            rule_b: user_name
+"""
+
+    def test_temporal_field_alias_grouping(self):
+        """temporal: alias maps different event fields into the same group."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._ALIAS_TEMPORAL_CORR)
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", username="alice"))
+            matches = matcher.match(self._event(0, event="access", user_name="alice"))
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            assert corr[0].group_values == {"user": "alice"}
+
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", username="alice"))
+            matches = matcher.match(self._event(0, event="access", user_name="bob"))
+            assert self._corr_matches(matches) == []
+
+    def test_temporal_ordered_field_alias(self):
+        """temporal_ordered with aliases: strictly increasing order fires within
+        the aliased group; equal timestamps do not."""
+        collection = self._collection(self._RULE_A, self._RULE_B, self._ALIAS_ORDERED_CORR)
+        with SigmaMatcher(collection) as matcher:
+            a_event = self._event(0, event="login", username="alice")
+            b_event = self._event(10, event="access", user_name="alice")
+            matcher.match(a_event)
+            matches = matcher.match(b_event)
+            corr = self._corr_matches(matches)
+            assert len(corr) == 1
+            assert corr[0].group_values == {"user": "alice"}
+            assert corr[0].events == [a_event, b_event]
+
+        with SigmaMatcher(collection) as matcher:
+            matcher.match(self._event(0, event="login", username="alice"))
+            matches = matcher.match(self._event(0, event="access", user_name="alice"))
+            assert self._corr_matches(matches) == []
+
+
 class TestModifiers:
     """Test that all Sigma modifiers produce correct matching behavior end-to-end."""
 
