@@ -32,7 +32,12 @@ def test_parametrized_validators_are_frozen(validator):
 
 
 def test_sigmavalidator_validate_rules(rule_with_id, rule_without_id, rules_with_id_collision):
-    rules = SigmaCollection([rule_with_id, rule_without_id, *rules_with_id_collision])
+    # Identifier collisions are reported as validation issues, so the collection is built without
+    # running reference resolution, which would reject the duplicate id up front.
+    rules = SigmaCollection(
+        [rule_with_id, rule_without_id, *rules_with_id_collision],
+        resolve_references=False,
+    )
     validator = SigmaValidator({IdentifierExistenceValidator, IdentifierUniquenessValidator})
     issues = validator.validate_rules(rules)
     assert issues == [
@@ -53,7 +58,10 @@ def test_sigmavalidator_validate_correlation_rules(correlation_rule):
 
 
 def test_sigmavalidator_exclusions(rule_with_id, rule_without_id, rules_with_id_collision):
-    rules = SigmaCollection([rule_with_id, rule_without_id, *rules_with_id_collision])
+    rules = SigmaCollection(
+        [rule_with_id, rule_without_id, *rules_with_id_collision],
+        resolve_references=False,
+    )
     exclusions = {
         UUID("32532a0b-e56c-47c9-bcbb-3d88bd670c37"): {IdentifierUniquenessValidator},
     }

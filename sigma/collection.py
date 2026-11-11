@@ -10,9 +10,13 @@ from uuid import UUID
 import yaml
 from typing import Self
 
-from sigma.correlations import SigmaCorrelationRule
+from sigma.correlations import SigmaCorrelationRule, SigmaRuleReference
 from sigma.exceptions import (
+    SigmaAliasReferenceError,
+    SigmaAmbiguousRuleNameError,
     SigmaCollectionError,
+    SigmaCorrelationCycleError,
+    SigmaDuplicateIdentifierError,
     SigmaError,
     SigmaRuleLocation,
     SigmaRuleNotFoundError,
@@ -26,6 +30,11 @@ if TYPE_CHECKING:
     from sigma.policy import SigmaPolicy
 
 NestedDict = dict[str, "str | int | float | bool | None | NestedDict"]
+RuleIdentifierIndex = dict[str, list["SigmaRule | SigmaCorrelationRule"]]
+ReferencePlan = dict[
+    int,
+    list[tuple["SigmaRuleReference", "SigmaRule | SigmaCorrelationRule"]],
+]
 
 
 @dataclass
@@ -43,6 +52,12 @@ class SigmaCollection:
     )
     names_to_rules: dict[str, SigmaRule | SigmaCorrelationRule] = field(
         init=False, repr=False, hash=False, compare=False
+    )
+    _references_resolved: bool = field(
+        init=False, repr=False, hash=False, compare=False, default=False
+    )
+    _filters_applied: bool = field(
+        init=False, repr=False, hash=False, compare=False, default=False
     )
 
     def __post_init__(
@@ -67,10 +82,8 @@ class SigmaCollection:
                 self.filters.append(rule)
             else:
                 raise TypeError(f"Object of type { type(rule) } not supported in SigmaCollection")
-        if self.filters and not collect_filters:
-            self.apply_filters(self.filters)
-        # By default resolve rule references after initialization. This can be disabled
-        # by passing resolve_references=False as an init-only parameter.
+        # By default resolve rule references after initialization. This also applies the collected
+        # filters. It can be disabled by passing resolve_references=False as an init-only parameter.
         if resolve_references:
             self.resolve_rule_references()
 
@@ -86,34 +99,335 @@ class SigmaCollection:
             )
             for rule in self.rules
         ]
+        # Filtered rule objects replace the previous ones, so any resolved reference state is
+        # stale. Invalidate it; the next conversion/matching call resolves the collection again.
+        self._invalidate_resolved_references()
+
+    def _invalidate_resolved_references(self: Self) -> None:
+        """Mark the collection as unresolved without leaving partially resolved rule objects."""
+        for rule in self.rules:
+            rule._backreferences = []
+            rule._output = True
+            if isinstance(rule, SigmaCorrelationRule):
+                rule.referenced_rules = []
+                for rule_ref in rule.iter_rule_references():
+                    if hasattr(rule_ref, "rule"):
+                        del rule_ref.rule
+                for alias_ref in rule.iter_alias_references():
+                    if hasattr(alias_ref, "rule"):
+                        del alias_ref.rule
+        self.ids_to_rules = {}
+        self.names_to_rules = {}
+        self._filters_applied = False
+        self._references_resolved = False
+
+    @staticmethod
+    def _rule_label(rule: SigmaRule | SigmaCorrelationRule) -> str:
+        """Stable textual identifier of a rule, used in error messages and reference chains."""
+        if rule.name is not None:
+            return rule.name
+        if rule.id is not None:
+            return str(rule.id)
+        if rule.source is not None:
+            return str(rule.source)
+        return rule.title or type(rule).__name__
+
+    @staticmethod
+    def _rule_sort_key(rule: SigmaRule | SigmaCorrelationRule) -> tuple[str, str]:
+        """Deterministic ordering key independent of file load order."""
+        source = str(rule.source.path) if rule.source is not None else ""
+        return (SigmaCollection._rule_label(rule), source)
+
+    @staticmethod
+    def _describe_rule(rule: SigmaRule | SigmaCorrelationRule) -> str:
+        """Describe a rule together with its source location for error messages."""
+        description = SigmaCollection._rule_label(rule)
+        if rule.source is not None:
+            description += f" (at { rule.source })"
+        return description
+
+    def _build_identifier_indexes(
+        self: Self,
+    ) -> tuple[
+        dict[UUID, list[SigmaRule | SigmaCorrelationRule]],
+        RuleIdentifierIndex,
+    ]:
+        """
+        Build multi-valued id/name indexes. Duplicates are kept here so that they can be reported
+        as deterministic errors instead of silently overwriting each other based on load order.
+        """
+        ids_index: dict[UUID, list[SigmaRule | SigmaCorrelationRule]] = {}
+        names_index: RuleIdentifierIndex = {}
+        for rule in self.rules:
+            if rule.id is not None:
+                ids_index.setdefault(rule.id, []).append(rule)
+            if rule.name is not None:
+                names_index.setdefault(rule.name, []).append(rule)
+        return ids_index, names_index
+
+    def _check_identifier_conflicts(
+        self: Self,
+        ids_index: dict[UUID, list[SigmaRule | SigmaCorrelationRule]],
+        names_index: RuleIdentifierIndex,
+    ) -> None:
+        """
+        Fail deterministically on duplicate ids.
+
+        Duplicate rule names are not an error by themselves: the rules may coexist as long as
+        nobody refers to the ambiguous name. Name ambiguity is raised when a reference actually
+        resolves through the name (see :meth:`_lookup_rule`), so the outcome never depends on
+        which of the same-named rules was loaded first.
+        """
+        for rule_id in sorted(ids_index, key=lambda identifier: str(identifier)):
+            rules = ids_index[rule_id]
+            if len(rules) > 1:
+                raise SigmaDuplicateIdentifierError(
+                    f"Duplicate rule id '{ rule_id }' used by: "
+                    + "; ".join(self._describe_rule(rule) for rule in rules),
+                    reference_chain=[str(rule_id)],
+                )
+
+    def _lookup_rule(
+        self: Self,
+        reference: str,
+        ids_index: dict[UUID, list[SigmaRule | SigmaCorrelationRule]],
+        names_index: RuleIdentifierIndex,
+        chain: list[str],
+        source: SigmaRuleLocation | None,
+    ) -> SigmaRule | SigmaCorrelationRule | None:
+        """Deterministic lookup: UUID references resolve by id, everything else by name."""
+        try:
+            rule_id = UUID(reference)
+        except ValueError:
+            candidates = names_index.get(reference)
+            if candidates is not None and len(candidates) > 1:
+                raise SigmaAmbiguousRuleNameError(
+                    f"Rule name '{ reference }' is ambiguous, it is used by: "
+                    + "; ".join(self._describe_rule(rule) for rule in candidates),
+                    source=source,
+                    reference_chain=chain,
+                )
+        else:
+            candidates = ids_index.get(rule_id)
+        if not candidates:
+            return None
+        return candidates[0]
+
+    def _validate_and_plan_references(
+        self: Self,
+        ids_index: dict[UUID, list[SigmaRule | SigmaCorrelationRule]],
+        names_index: RuleIdentifierIndex,
+    ) -> tuple[ReferencePlan, ReferencePlan]:
+        """
+        Resolve every reference of every correlation rule without mutating any rule.
+
+        Detects missing references, references that appear only in field aliases and dependency
+        cycles. Forward references are legal because the whole collection is available. Errors
+        carry the referencing rule's source location and the full reference chain.
+        """
+        # Reference string -> rule object; conflicts were checked before, so this is load-order
+        # independent.
+        resolved: dict[str, SigmaRule | SigmaCorrelationRule] = {}
+
+        def resolve_reference(
+            reference: str,
+            chain: list[str],
+            source: SigmaRuleLocation | None,
+        ) -> SigmaRule | SigmaCorrelationRule:
+            if reference in resolved:
+                return resolved[reference]
+            target = self._lookup_rule(reference, ids_index, names_index, chain, source)
+            if target is None:
+                raise SigmaRuleNotFoundError(
+                    f"Rule '{ reference }' not found in rule collection",
+                    source=source,
+                    reference_chain=chain,
+                )
+            resolved[reference] = target
+            return target
+
+        # First pass: resolve the dependency references of each correlation rule and remember the
+        # planned reference -> rule mappings. Alias-only references are detected alongside.
+        plan: ReferencePlan = {}
+        alias_plan: ReferencePlan = {}
+        for correlation in self.rules:
+            if not isinstance(correlation, SigmaCorrelationRule):
+                continue
+            chain_prefix = [self._rule_label(correlation)]
+            dependency_strings: set[str] = set()
+            correlation_plan: list[
+                tuple[SigmaRuleReference, SigmaRule | SigmaCorrelationRule]
+            ] = []
+            for rule_ref in correlation.iter_rule_references():
+                dependency_strings.add(rule_ref.reference)
+                target = resolve_reference(
+                    rule_ref.reference,
+                    chain_prefix + [rule_ref.reference],
+                    correlation.source,
+                )
+                correlation_plan.append((rule_ref, target))
+            plan[id(correlation)] = correlation_plan
+
+            correlation_alias_plan: list[
+                tuple[SigmaRuleReference, SigmaRule | SigmaCorrelationRule]
+            ] = []
+            for alias_ref in correlation.iter_alias_references():
+                target = resolve_reference(
+                    alias_ref.reference,
+                    chain_prefix + [alias_ref.reference],
+                    correlation.source,
+                )
+                correlation_alias_plan.append((alias_ref, target))
+                if alias_ref.reference not in dependency_strings:
+                    raise SigmaAliasReferenceError(
+                        f"Rule '{ alias_ref.reference }' is referenced in a field alias of "
+                        f"'{ self._rule_label(correlation) }' but not in its rule references",
+                        source=correlation.source,
+                        reference_chain=chain_prefix + [alias_ref.reference],
+                    )
+            alias_plan[id(correlation)] = correlation_alias_plan
+
+        self._detect_reference_cycles(plan)
+        return plan, alias_plan
+
+    def _detect_reference_cycles(self: Self, plan: ReferencePlan) -> None:
+        """
+        Detect cycles in the correlation-rule dependency graph using an iterative,
+        order-independent DFS. The reported cycle starts from the deterministically smallest
+        correlation rule on the cycle.
+        """
+        graph: dict[int, list[SigmaCorrelationRule]] = {}
+        for rule in self.rules:
+            if isinstance(rule, SigmaCorrelationRule):
+                graph[id(rule)] = [
+                    target
+                    for _, target in plan.get(id(rule), [])
+                    if isinstance(target, SigmaCorrelationRule)
+                ]
+
+        state: dict[int, int] = {}  # 0 = unvisited, 1 = on stack, 2 = done
+        stack_path: list[SigmaCorrelationRule] = []
+
+        def raise_cycle(cycle_start: SigmaCorrelationRule) -> None:
+            start_index = stack_path.index(cycle_start)
+            cycle_nodes = stack_path[start_index:] + [cycle_start]
+            chain = [self._rule_label(rule) for rule in cycle_nodes]
+            raise SigmaCorrelationCycleError(
+                "Cyclic rule reference detected: " + " -> ".join(chain),
+                source=cycle_start.source,
+                reference_chain=chain,
+            )
+
+        correlation_roots = [rule for rule in self.rules if id(rule) in graph]
+        for root in sorted(correlation_roots, key=self._rule_sort_key):
+            if id(root) in state:
+                continue
+            work: list[tuple[SigmaCorrelationRule, int]] = [(root, 0)]
+            state[id(root)] = 1
+            stack_path = [root]
+            while work:
+                node, next_child = work[-1]
+                children = graph[id(node)]
+                if next_child < len(children):
+                    work[-1] = (node, next_child + 1)
+                    child = children[next_child]
+                    child_state = state.get(id(child))
+                    if child_state == 1:
+                        raise_cycle(child)
+                    elif child_state is None:
+                        state[id(child)] = 1
+                        stack_path.append(child)
+                        work.append((child, 0))
+                else:
+                    state[id(node)] = 2
+                    stack_path.pop()
+                    work.pop()
 
     def resolve_rule_references(self: Self) -> None:
         """
-        Resolve rule references in correlation rules to the actual rule objects and sort the rules
-        by reference order (rules that are referenced by other rules come first).
+        Resolve rule references in correlation rules to the actual rule objects and order the
+        rules so that every rule comes after the rules it refers to.
 
-        This must be called before referencing rules are converted into queries to make references available.
+        Validation is performed for the whole collection first. Only if every reference (rule
+        lists, extended correlation conditions and field aliases) is valid, the resolved state is
+        applied atomically: a failure never leaves a partially resolved collection behind. The
+        result is independent of the order in which the rules were loaded and calling the method
+        again on an already resolved collection is a no-op.
+
+        This must be called before referencing rules are converted into queries or events are
+        matched.
         """
-        for rule in self.rules:
-            # Resolves all rule references in the rules property to actual Sigma rules.
-            if isinstance(rule, SigmaCorrelationRule):
-                rule.resolve_rule_references(self)
-
-        # Extract all filters from the rules
-        filters: list[SigmaFilter] = [
+        # Filters embedded in the rules list have not been applied yet. Filters kept in
+        # self.filters were either deferred (load_ruleset/collect_filters) or already applied and
+        # retained for inspection; the _filters_applied flag tells the two cases apart.
+        pending_filters = (
+            []
+            if self._filters_applied
+            else list(self.filters)
+        ) + [
             cast("SigmaFilter", rule) for rule in self.rules if isinstance(rule, SigmaFilter)
         ]
-        self.rules = [rule for rule in self.rules if not isinstance(rule, SigmaFilter)]
+        if self._references_resolved and not pending_filters:
+            return
 
-        # Apply filters on each rule and replace the rule with the filtered rule
-        self.rules = (
-            [reduce(lambda r, f: f.apply_on_rule(r), filters, rule) for rule in self.rules]
-            if filters
-            else self.rules
-        )
+        # Filters are applied to Sigma rules first. They never apply to correlation rules and thus
+        # cannot change the reference graph validated below.
+        if pending_filters:
+            self.rules = [rule for rule in self.rules if not isinstance(rule, SigmaFilter)]
+            self.rules = [
+                reduce(lambda r, f: f.apply_on_rule(r), pending_filters, rule)
+                for rule in self.rules
+            ]
+            # Keep the applied filters available for inspection (collect_filters semantics) and
+            # remember that they must not be applied again.
+            self.filters = self.filters + [
+                cast("SigmaFilter", rule)
+                for rule in pending_filters
+                if rule not in self.filters
+            ]
+            self._filters_applied = True
+            self._references_resolved = False
+
+        ids_index, names_index = self._build_identifier_indexes()
+        self._check_identifier_conflicts(ids_index, names_index)
+        plan, alias_plan = self._validate_and_plan_references(ids_index, names_index)
+
+        # All checks passed: apply the planned resolution. Reset mutable per-rule state first so
+        # that re-resolution cannot accumulate duplicate backreferences or leave output disabled.
+        for rule in self.rules:
+            rule._backreferences = []
+            rule._output = True
+            if isinstance(rule, SigmaCorrelationRule):
+                rule.referenced_rules = []
+                for rule_ref in rule.iter_rule_references():
+                    if hasattr(rule_ref, "rule"):
+                        del rule_ref.rule
+                for alias_ref in rule.iter_alias_references():
+                    if hasattr(alias_ref, "rule"):
+                        del alias_ref.rule
+
+        for correlation in self.rules:
+            if not isinstance(correlation, SigmaCorrelationRule):
+                continue
+            mappings = plan.get(id(correlation), [])
+            correlation.referenced_rules = [rule_ref for rule_ref, _ in mappings]
+            for rule_ref, target in mappings:
+                rule_ref.rule = target
+                target.add_backreference(correlation)
+                if not correlation.generate:
+                    target.disable_output()
+            for alias_ref, target in alias_plan.get(id(correlation), []):
+                alias_ref.rule = target
 
         # Order rules so that every rule comes after the rules it refers to
         self.rules = self._referenced_first(self.rules)
+        self.ids_to_rules = {
+            rule.id: rule for rule in self.rules if rule.id is not None
+        }
+        self.names_to_rules = {
+            rule.name: rule for rule in self.rules if rule.name is not None
+        }
+        self._references_resolved = True
 
     @staticmethod
     def _referenced_first(

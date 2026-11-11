@@ -250,7 +250,64 @@ class SigmaTimespanError(SigmaCorrelationRuleError):
 class SigmaRuleNotFoundError(SigmaCorrelationRuleError):
     """Sigma rule not found."""
 
-    pass
+    def __init__(
+        self,
+        *args: Any,
+        source: SigmaRuleLocation | None = None,
+        reference_chain: list[str] | None = None,
+        **kwargs: dict[str, Any],
+    ) -> None:
+        self.reference_chain: list[str] = list(reference_chain or [])
+        super().__init__(*args, source=source, **kwargs)
+
+    def __str__(self) -> str:
+        result = super().__str__()
+        if self.reference_chain:
+            result += " (reference chain: " + " -> ".join(self.reference_chain) + ")"
+        return result
+
+
+class SigmaCollectionReferenceError(SigmaError):
+    """
+    Base class for errors detected while resolving rule references inside a
+    :class:`sigma.collection.SigmaCollection`.
+
+    Every reference error carries the deterministic ``reference_chain`` that led to the failure so
+    that problems can be traced back across nested correlation rules independently of file load
+    order.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        source: SigmaRuleLocation | None = None,
+        reference_chain: list[str] | None = None,
+        **kwargs: dict[str, Any],
+    ) -> None:
+        self.reference_chain: list[str] = list(reference_chain or [])
+        super().__init__(*args, source=source, **kwargs)
+
+    def __str__(self) -> str:
+        result = super().__str__()
+        if self.reference_chain:
+            result += " (reference chain: " + " -> ".join(self.reference_chain) + ")"
+        return result
+
+
+class SigmaDuplicateIdentifierError(SigmaCollectionReferenceError):
+    """Two rules in the same collection declare the same rule id."""
+
+
+class SigmaAmbiguousRuleNameError(SigmaCollectionReferenceError):
+    """A rule name resolves to more than one rule in the collection."""
+
+
+class SigmaCorrelationCycleError(SigmaCollectionReferenceError):
+    """Rule references form a dependency cycle."""
+
+
+class SigmaAliasReferenceError(SigmaCollectionReferenceError):
+    """A rule is referenced by a field alias but not by the correlation rule itself."""
 
 
 # Meta Filter Error

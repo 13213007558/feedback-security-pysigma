@@ -34,6 +34,10 @@ class SigmaMatcher:
     ) -> None:
         self._compiler = MatchCompiler()
 
+        # An invalid collection (missing or ambiguous references, dependency cycles, ...) must be
+        # rejected before any event is matched. Resolution is a no-op when it already succeeded.
+        collection.resolve_rule_references()
+
         # Apply pipeline if provided
         if pipeline is not None:
             for rule in collection.rules:

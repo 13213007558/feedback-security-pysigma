@@ -173,7 +173,11 @@ def test_validator_duplicate_references_valid():
 
 def test_validator_duplicate_filename():
     validator = DuplicateFilenameValidator()
-    sigma_collection = SigmaCollection.load_ruleset(["tests/files/ruleset_duplicate"])
+    # The fixture intentionally contains duplicate rule ids; keep resolution disabled so that the
+    # validator (not the collection) reports the collision as an issue.
+    sigma_collection = SigmaCollection.load_ruleset(
+        ["tests/files/ruleset_duplicate"], resolve_references=False
+    )
     rule1 = sigma_collection[0]
     rule2 = sigma_collection[1]
     assert validator.validate(rule1) == []

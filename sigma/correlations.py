@@ -781,6 +781,31 @@ class SigmaCorrelationRule(SigmaRuleBase, ProcessingItemTrackingMixin):
 
         return d
 
+    def iter_rule_references(self: Self) -> "Iterator[SigmaRuleReference]":
+        """
+        Yield the rule references that define the correlation's dependencies, in their declared
+        order. References of an extended condition are taken from the parsed condition tree.
+        """
+        if self.rules is not None:
+            yield from self.rules
+        elif isinstance(self.condition, SigmaExtendedCorrelationCondition):
+            yield from self._iter_condition_references(self.condition.parsed)
+
+    def iter_alias_references(self: Self) -> "Iterator[SigmaRuleReference]":
+        """Yield the rule references that appear only in field alias mappings."""
+        for alias in self.aliases:
+            yield from alias.mapping.keys()
+
+    @staticmethod
+    def _iter_condition_references(
+        node: CorrelationConditionItem | SigmaRuleReference,
+    ) -> "Iterator[SigmaRuleReference]":
+        if isinstance(node, SigmaRuleReference):
+            yield node
+        else:
+            for arg in node.args:
+                yield from SigmaCorrelationRule._iter_condition_references(arg)
+
     def resolve_rule_references(self: Self, rule_collection: SigmaCollection) -> None:
         """
         Resolves all rule references in the rules property to actual Sigma rules.
@@ -792,7 +817,7 @@ class SigmaCorrelationRule(SigmaRuleBase, ProcessingItemTrackingMixin):
         """
         # Determine which rules to use: explicit rules or extracted from extended condition
         if self.rules is not None:
-            self.referenced_rules = self.rules
+            self.referenced_rules = list(self.rules)
         elif isinstance(self.condition, SigmaExtendedCorrelationCondition):
             referenced_rule_names = self.condition.get_referenced_rules()
             self.referenced_rules = [SigmaRuleReference(name) for name in referenced_rule_names]
