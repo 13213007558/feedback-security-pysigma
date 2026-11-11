@@ -148,6 +148,11 @@ Here are the most important categories:
 * ``contains_expression``: Format string for contains matching.
 * ``wildcard_match_expression``: Format string for wildcard matching.
 * ``re_expression``: Format string for regex matching with ``{field}`` and ``{regex}``.
+* ``regex_engine``: Regex engine declaring the regex features (backreferences, lookaround
+  assertions) supported by the target query language. Regular expressions using unsupported
+  features are rejected during conversion with ``SigmaFeatureNotSupportedByBackendError``.
+  Defaults to ``None``, which resolves the engine from the processing pipeline policy or the
+  default policy.
 
 **Comparison and Special Expressions:**
 

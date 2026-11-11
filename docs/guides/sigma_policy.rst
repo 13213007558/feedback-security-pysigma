@@ -42,6 +42,16 @@ Settings
    protection with no backtracking. Can be set to ``PythonRegexEngine`` for broader regex
    support when DoS protection is not a concern.
 
+   Each regex engine also declares the regex features it supports
+   (``RegexFeature.BACKREFERENCE`` and ``RegexFeature.LOOKAROUND``). ``RE2RegexEngine``
+   supports neither, ``PythonRegexEngine`` supports both. During query conversion, backends
+   check every regular expression that reaches the query — whether it originates from a
+   ``re`` modifier, a placeholder expansion or a transformation — against these capabilities
+   and raise ``SigmaFeatureNotSupportedByBackendError`` for unsupported features. A backend
+   can pin the capabilities of its target query language with the ``regex_engine`` class
+   variable; otherwise the engine is resolved from the processing pipeline policy or the
+   default policy.
+
 ``allow_template_vars``
    Enables the ``vars`` feature of template-based postprocessing and finalizers. That feature
    executes Python code from a referenced file and is therefore disabled by default.

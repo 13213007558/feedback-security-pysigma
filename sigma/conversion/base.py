@@ -41,6 +41,7 @@ from sigma.exceptions import (
     SigmaFeatureNotSupportedByBackendError,
     SigmaValueError,
 )
+from sigma.policy.regex_engine import RegexEngine
 from sigma.processing.pipeline import ProcessingPipeline
 from sigma.rule import SigmaRule
 from sigma.rule.detection import SigmaDetection, SigmaDetectionItem
@@ -1166,6 +1167,12 @@ class TextQueryBackend(Backend):
     # remove it from re_flags or don't define it to ensure proper error handling in case of appearance.
     re_flags: dict[SigmaRegularExpressionFlag, str] = SigmaRegularExpression.sigma_to_re_flag
 
+    # Regex engine that declares the regular expression features (e.g. backreferences, lookaround
+    # assertions) supported by the target query language. Regular expressions that use features not
+    # supported by this engine are rejected during conversion. If None, the engine is resolved from
+    # the policy of the processing pipeline or the default policy.
+    regex_engine: ClassVar[RegexEngine | None] = None
+
     # Case sensitive string matching expression. String is quoted/escaped like a normal string.
     # Placeholders {field} and {value} are replaced with field name and quoted/escaped string.
     # {regex} contains the value expressed as regular expression.
@@ -2085,6 +2092,53 @@ class TextQueryBackend(Backend):
             self.re_flag_prefix,
         )
 
+    def resolve_regex_engine(self) -> RegexEngine:
+        """Return the regex engine that declares the regular expression capabilities of the
+        target query language. The engine explicitly declared by the backend in the regex_engine
+        class variable takes precedence, otherwise the engine is resolved from the policy of the
+        processing pipeline or the default policy."""
+        if self.regex_engine is not None:
+            return self.regex_engine
+        pipeline = getattr(self, "last_processing_pipeline", None)
+        if pipeline is not None:
+            return pipeline.resolve_regex_engine()  # type: ignore[no-any-return]
+        from sigma.policy import default_policy
+
+        return default_policy.regex_engine
+
+    def check_regex_capabilities(
+        self,
+        r: SigmaRegularExpression,
+        cond: ConditionFieldEqualsValueExpression | ConditionValueExpression,
+    ) -> None:
+        """Verify that the regular expression *r* only uses features supported by the target
+        query language and raise a SigmaFeatureNotSupportedByBackendError if this is not the
+        case. This check is applied to all regular expressions that reach the query conversion,
+        regardless if they originate from a re modifier, a placeholder expansion or a
+        transformation in the processing pipeline."""
+        unsupported = self.resolve_regex_engine().unsupported_features(str(r.regexp))
+        if not unsupported:
+            return
+        features = ", ".join(sorted(feature.name.lower() for feature in unsupported))
+        message = (
+            f"Regular expression '{str(r.regexp)}' uses regex features not supported by "
+            f"backend '{self.name}': {features}"
+        )
+        processing_item_ids = sorted(
+            {
+                processing_item_id
+                for parent in cond.parent_chain()
+                if isinstance(parent, SigmaDetectionItem)
+                for processing_item_id in parent.applied_processing_items
+            }
+        )
+        if processing_item_ids:
+            message += (
+                ". Expression was introduced or modified by processing pipeline item(s): "
+                + ", ".join(processing_item_ids)
+            )
+        raise SigmaFeatureNotSupportedByBackendError(message, source=cond.source)
+
     def get_flag_template(self, r: SigmaRegularExpression) -> dict[str, str]:
         """Return the flag_x template variales used for regular expression templates as dict that
         maps flag_x template variable names to the static template if flag is set in regular
@@ -2112,6 +2166,7 @@ class TextQueryBackend(Backend):
             raise NotImplementedError(
                 "Regular expression template is not supported by the backend."
             )
+        self.check_regex_capabilities(cond_value, cond)
         flag_kwargs = self.get_flag_template(cond_value)
         return self.re_expression.format(
             field=self.escape_and_quote_field(cond.field),
@@ -2132,6 +2187,7 @@ class TextQueryBackend(Backend):
             raise NotImplementedError(
                 "Regular expression template is not supported by the backend."
             )
+        self.check_regex_capabilities(cond_value, cond)
         flag_kwargs = self.get_flag_template(cond_value)
         return self.re_expression.format(
             field=self.escape_and_quote_field(cond.field),
@@ -2345,6 +2401,7 @@ class TextQueryBackend(Backend):
             raise NotImplementedError(
                 "Regular expression template is not supported by the backend."
             )
+        self.check_regex_capabilities(cond_value, cond)
         flag_kwargs = self.get_flag_template(cond_value)
         return self.unbound_value_re_expression.format(
             value=self.convert_value_re(cond_value, state), **flag_kwargs

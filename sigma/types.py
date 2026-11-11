@@ -914,7 +914,7 @@ class SigmaRegularExpression(SigmaType):
         Replace all occurrences of string part matching regular expression with placeholder.
         """
         return [
-            SigmaRegularExpression(str(sigmastr), self.flags)
+            SigmaRegularExpression(str(sigmastr), self.flags, policy=self.policy)
             for sigmastr in self.regexp.replace_placeholders(callback)
         ]
 
