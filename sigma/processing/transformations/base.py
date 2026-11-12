@@ -323,11 +323,22 @@ class FieldMappingTransformationBase(DetectionItemTransformation):
                 self.processing_item_applied(detection_item)
                 result = detection_item
             else:
+                split_detection_items = []
+                for mapped_field in mapping:
+                    split_detection_item = dataclasses.replace(
+                        detection_item, field=mapped_field, auto_modifiers=False
+                    )
+                    # dataclasses.replace() re-runs the default_factory of init=False fields,
+                    # therefore each split detection item would start with an empty tracking set
+                    # and lose the processing history of the original item. Carry over the
+                    # history so that later processing-item conditions still recognize every
+                    # split item as having passed through the previous processing steps.
+                    split_detection_item.applied_processing_items = set(
+                        detection_item.applied_processing_items
+                    )
+                    split_detection_items.append(split_detection_item)
                 result = SigmaDetection(
-                    [
-                        dataclasses.replace(detection_item, field=field, auto_modifiers=False)
-                        for field in mapping
-                    ],
+                    split_detection_items,
                     item_linking=ConditionOR,
                 )
         if field_match or fieldref_match:  # field name was changed or field reference was mapped

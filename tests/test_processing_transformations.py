@@ -23,6 +23,7 @@ from sigma.exceptions import (
 )
 from sigma.modifiers import SigmaExpandModifier, SigmaRegularExpressionModifier
 from sigma.processing.conditions import (
+    DetectionItemProcessingItemAppliedCondition,
     FieldNameProcessingItemAppliedCondition,
     IncludeFieldCondition,
     RuleContainsDetectionItemCondition,
@@ -3758,3 +3759,273 @@ def test_extract_fields_transformation_mixed_matches_preserve_true():
     assert isinstance(third, SigmaDetection)
     assert third.detection_items[0].field == "reg.type"
     assert third.detection_items[0].value == [SigmaString("Qword")]
+
+
+def _flatten_detection_items(rule: SigmaRule):
+    items = []
+
+    def collect(detection: SigmaDetection):
+        for item in detection.detection_items:
+            if isinstance(item, SigmaDetection):
+                collect(item)
+            else:
+                items.append(item)
+
+    for detection in rule.detection.detections.values():
+        collect(detection)
+    return items
+
+
+def test_field_mapping_one_to_many_keeps_tracking_on_split_items():
+    """Every split item must carry the processing history of its origin so that later
+    detection-item conditions still recognize it as having passed through the split."""
+    pipeline = ProcessingPipeline(
+        [
+            ProcessingItem(
+                identifier="split",
+                transformation=FieldMappingTransformation({"src": ["src_a", "src_b"]}),
+            ),
+            ProcessingItem(
+                identifier="guard",
+                transformation=FieldMappingTransformation(
+                    {"src_a": "src_a_sec", "src_b": "src_b_sec"}
+                ),
+                detection_item_conditions=[
+                    DetectionItemProcessingItemAppliedCondition("split"),
+                ],
+            ),
+        ]
+    )
+    rule = pipeline.apply(
+        SigmaRule.from_yaml(
+            """
+title: t
+logsource: {product: test}
+detection:
+  sel: {src: evil}
+  other: {unrelated: x}
+  condition: sel or other
+"""
+        )
+    )
+    tracked = {
+        item.field: (item.was_processed_by("split"), item.was_processed_by("guard"))
+        for item in _flatten_detection_items(rule)
+    }
+    assert tracked == {
+        "src_a_sec": (True, True),
+        "src_b_sec": (True, True),
+        "unrelated": (False, False),
+    }
+    query = TextQueryTestBackend(pipeline).convert_rule(
+        SigmaRule.from_yaml(
+            """
+title: t
+logsource: {product: test}
+detection:
+  sel: {src: evil}
+  other: {unrelated: x}
+  condition: sel or other
+"""
+        )
+    )[0]
+    assert query == 'src_a_sec="evil" or src_b_sec="evil" or unrelated="x"'
+
+
+def test_field_mapping_two_consecutive_splits_preserve_full_history():
+    """History from the first one-to-many split must survive a second one-to-many split and
+    still gate the follow-up transformation for every resulting item."""
+    pipeline = ProcessingPipeline(
+        [
+            ProcessingItem(
+                identifier="split1",
+                transformation=FieldMappingTransformation({"src": ["a", "b"]}),
+            ),
+            ProcessingItem(
+                identifier="split2",
+                transformation=FieldMappingTransformation(
+                    {"a": ["a1", "a2"], "b": ["b1", "b2"]}
+                ),
+            ),
+            ProcessingItem(
+                identifier="guard",
+                transformation=FieldMappingTransformation(
+                    {"a1": "a1_g", "a2": "a2_g", "b1": "b1_g", "b2": "b2_g"}
+                ),
+                detection_item_conditions=[
+                    DetectionItemProcessingItemAppliedCondition("split1"),
+                ],
+            ),
+        ]
+    )
+    rule = pipeline.apply(
+        SigmaRule.from_yaml(
+            """
+title: t
+logsource: {product: test}
+detection:
+  sel: {src: evil}
+  other: {unrelated: x}
+  condition: sel or other
+"""
+        )
+    )
+    fields = {item.field for item in _flatten_detection_items(rule)}
+    assert fields == {"a1_g", "a2_g", "b1_g", "b2_g", "unrelated"}
+    for item in _flatten_detection_items(rule):
+        if item.field == "unrelated":
+            assert not item.was_processed_by("guard")
+        else:
+            assert item.was_processed_by("split1")
+            assert item.was_processed_by("split2")
+            assert item.was_processed_by("guard")
+    query = TextQueryTestBackend(pipeline).convert_rule(
+        SigmaRule.from_yaml(
+            """
+title: t
+logsource: {product: test}
+detection:
+  sel: {src: evil}
+  other: {unrelated: x}
+  condition: sel or other
+"""
+        )
+    )[0]
+    assert query == (
+        'a1_g="evil" or a2_g="evil" or b1_g="evil" or b2_g="evil" or unrelated="x"'
+    )
+
+
+def test_field_mapping_same_target_name_does_not_cross_origins():
+    """Two source fields mapped to the same target name keep independent processing history.
+    A follow-up step gated on the split must not touch the item that only went through the
+    unrelated rename."""
+    pipeline = ProcessingPipeline(
+        [
+            ProcessingItem(
+                identifier="split",
+                transformation=FieldMappingTransformation(
+                    {"src": ["shared", "src_extra"]}
+                ),
+            ),
+            ProcessingItem(
+                identifier="alias",
+                transformation=FieldMappingTransformation({"direct": "shared"}),
+            ),
+            ProcessingItem(
+                identifier="guard",
+                transformation=FieldMappingTransformation({"shared": "shared_guarded"}),
+                detection_item_conditions=[
+                    DetectionItemProcessingItemAppliedCondition("split"),
+                ],
+            ),
+        ]
+    )
+    rule = pipeline.apply(
+        SigmaRule.from_yaml(
+            """
+title: t
+logsource: {product: test}
+detection:
+  sel:
+    src: evil
+    direct: data
+  condition: sel
+"""
+        )
+    )
+    tracked = {
+        item.field: sorted(item.applied_processing_items)
+        for item in _flatten_detection_items(rule)
+    }
+    assert tracked == {
+        "shared_guarded": ["guard", "split"],
+        "src_extra": ["split"],
+        # The renamed item never passed through 'split'/'guard'; it stays on 'shared'.
+        "shared": ["alias"],
+    }
+    query = TextQueryTestBackend(pipeline).convert_rule(
+        SigmaRule.from_yaml(
+            """
+title: t
+logsource: {product: test}
+detection:
+  sel:
+    src: evil
+    direct: data
+  condition: sel
+"""
+        )
+    )[0]
+    assert query == '(shared_guarded="evil" or src_extra="evil") and shared="data"'
+
+
+def test_field_mapping_one_to_one_behavior_unchanged():
+    """Plain one-to-one mappings must still mark the single in-place detection item."""
+    pipeline = ProcessingPipeline(
+        [
+            ProcessingItem(
+                identifier="rename",
+                transformation=FieldMappingTransformation({"fieldA": "mappedA"}),
+            ),
+        ]
+    )
+    rule = pipeline.apply(
+        SigmaRule.from_yaml(
+            """
+title: t
+logsource: {product: test}
+detection:
+  sel:
+    fieldA: valueA
+    fieldB: valueB
+  condition: sel
+"""
+        )
+    )
+    tracked = {
+        item.field: item.was_processed_by("rename")
+        for item in _flatten_detection_items(rule)
+    }
+    assert tracked == {"mappedA": True, "fieldB": False}
+    assert pipeline.field_mappings == {"fieldA": {"mappedA"}}
+
+
+def test_field_mapping_one_to_many_preserves_or_linking_inside_and():
+    """A one-to-many split must introduce an OR group and must not flip the surrounding
+    detection's AND linking to OR."""
+    pipeline = ProcessingPipeline(
+        [
+            ProcessingItem(
+                identifier="split",
+                transformation=FieldMappingTransformation({"src": ["left", "right"]}),
+            ),
+        ]
+    )
+    rule = pipeline.apply(
+        SigmaRule.from_yaml(
+            """
+title: t
+logsource: {product: test}
+detection:
+  sel:
+    src: evil
+    other: data
+  condition: sel
+"""
+        )
+    )
+    detection = rule.detection.detections["sel"]
+    # Outer detection still AND-links its members.
+    assert detection.item_linking is ConditionAND
+    split_group = next(
+        item for item in detection.detection_items if isinstance(item, SigmaDetection)
+    )
+    # The split itself is an OR group.
+    assert split_group.item_linking is ConditionOR
+    assert [item.field for item in split_group.detection_items] == ["left", "right"]
+
+    tree = rule.detection.parsed_condition[0].parsed
+    assert isinstance(tree, ConditionAND)
+    split_node = next(node for node in tree.args if isinstance(node, ConditionOR))
+    assert {node.field for node in split_node.args} == {"left", "right"}
